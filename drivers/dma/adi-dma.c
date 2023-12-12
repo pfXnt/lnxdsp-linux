@@ -334,36 +334,95 @@ static void get_txn_align(dma_addr_t src, dma_addr_t dst, size_t size,
 	}
 }
 
-/*
- * Only used with peripheral attached DMA and considers the burst characteristics
- * of the peripheral in addition to the memory and transaction size to make sure
- * that reads/writes work properly
+/**
+ * Retrieve the peripheral dma transfer sizes based on the burst settings.
+ * This relies a lot on getting the src/dest max burst configuration correct
+ * which is generally peripheral specific. An invalid result will cause an error
+ * like 0x6002 in dma stat, while too small of burst settings will degrade system
+ * performance
  */
 static void get_periph_align(struct adi_dma_channel *adi_chan,
 	enum dma_transfer_direction direction, dma_addr_t mem, size_t len,
 	u32 *conf, u32 *shift)
 {
 	struct dma_slave_config *cfg = &adi_chan->config;
-	u32 burst = 0;
+	u32 mburst, pburst;
+	u32 lconf = 0;
 
-	if (direction == DMA_DEV_TO_MEM)
-		burst = cfg->src_maxburst * cfg->src_addr_width;
-	else
-		burst = cfg->dst_maxburst * cfg->src_addr_width;
-
-	if (mem % 8 == 0 && len % 8 == 0 && burst >= 8) {
-		*conf = WDSIZE_64 | PSIZE_64;
-		*shift = 3;
-	} else if (mem % 4 == 0 && len % 4 == 0 && burst >= 4) {
-		*conf = WDSIZE_32 | PSIZE_32;
-		*shift = 2;
-	} else if (mem % 2 == 0 && len % 2 == 0 && burst >= 2) {
-		*conf = WDSIZE_16 | PSIZE_16;
-		*shift = 1;
+	if (DMA_DEV_TO_MEM == direction) {
+		pburst = cfg->src_maxburst * cfg->src_addr_width;
+		mburst = cfg->dst_maxburst * cfg->dst_addr_width;
 	} else {
-		*conf = WDSIZE_8 | PSIZE_8;
-		*shift = 0;
+		pburst = cfg->dst_maxburst * cfg->dst_addr_width;
+		mburst = cfg->src_maxburst * cfg->src_addr_width;
 	}
+
+	// HW limits on maximum burst size in bytes
+	if (pburst > 8)
+		pburst = 8;
+
+	if (mburst > 32)
+		mburst = 32;
+
+	// Find the max bursts that divide the transfer length and align correctly
+	while (len % pburst || mem % pburst)
+		pburst = pburst / 2;
+
+	while (len % mburst || mem % mburst)
+		mburst = mburst / 2;
+
+	switch (mburst) {
+	case 32:
+		lconf = WDSIZE_256;
+		*shift = 5;
+		break;
+	case 16:
+		lconf = WDSIZE_128;
+		*shift = 4;
+		break;
+	case 8:
+		lconf = WDSIZE_64;
+		*shift = 3;
+		break;
+	case 4:
+		lconf = WDSIZE_32;
+		*shift = 2;
+		break;
+	case 2:
+		lconf = WDSIZE_16;
+		*shift = 1;
+		break;
+	default:
+		dev_err(adi_chan->dma->dev,
+			"%s: invalid mem-side burst config %u, defaulting to 1 byte\n",
+			__func__, mburst);
+		// fallthrough
+	case 1:
+		lconf = WDSIZE_8;
+		*shift = 0;
+		break;
+	}
+
+	switch (pburst) {
+	case 8:
+		lconf |= PSIZE_64;
+		break;
+	case 4:
+		lconf |= PSIZE_32;
+		break;
+	case 2:
+		lconf |= PSIZE_16;
+		break;
+	default:
+		dev_err(adi_chan->dma->dev,
+			"%s: invalid burst length %u, defaulting to 1 byte\n", __func__, pburst);
+		// fallthrough
+	case 1:
+		lconf |= PSIZE_8;
+		break;
+	}
+
+	*conf = lconf;
 }
 
 static dma_cookie_t adi_submit(struct dma_async_tx_descriptor *tx)
@@ -770,9 +829,11 @@ static irqreturn_t __adi_dma_handler(struct adi_dma_channel *channel,
 
 	desc->result.result = result;
 	desc->result.residue = 0;
-	list_add_tail(&desc->cb_node, &channel->cb_pending);
 
+	// Cyclic interrupts do not use the pending list to avoid complications
+	// during dma termination
 	if (!desc->cyclic) {
+		list_add_tail(&desc->cb_node, &channel->cb_pending);
 		channel->current_desc = NULL;
 		__issue_pending(channel);
 	}
@@ -829,21 +890,26 @@ static irqreturn_t adi_dma_thread_handler(int irq, void *id)
 
 	spin_lock_irqsave(&channel->lock, flags);
 
+	if (channel->current_desc && channel->current_desc->cyclic) {
+		dmaengine_desc_get_callback(&channel->current_desc->tx, &cb);
+
+		spin_unlock_irqrestore(&channel->lock, flags);
+		dmaengine_desc_callback_invoke(&cb, &channel->current_desc->result);
+		return IRQ_HANDLED;
+	}
+
 	while (!list_empty(&channel->cb_pending)) {
 		desc = list_first_entry(&channel->cb_pending, struct adi_dma_descriptor,
 			cb_node);
 		list_del(&desc->cb_node);
 
-		if (!desc->cyclic)
-			dma_cookie_complete(&desc->tx);
+		dma_cookie_complete(&desc->tx);
 		dmaengine_desc_get_callback(&desc->tx, &cb);
 
 		spin_unlock_irqrestore(&channel->lock, flags);
 		dmaengine_desc_callback_invoke(&cb, &desc->result);
 
-		if (!desc->cyclic)
-			desc->tx.desc_free(&desc->tx);
-
+		desc->tx.desc_free(&desc->tx);
 		spin_lock_irqsave(&channel->lock, flags);
 	}
 
@@ -1001,6 +1067,12 @@ static struct dma_async_tx_descriptor *adi_prep_cyclic(struct dma_chan *chan,
 
 	get_periph_align(adi_chan, direction, buf, period_len, &conf, &shift);
 
+	if (len != ((len / period_len) * period_len)) {
+		dev_warn(dma->dev,
+			"%s: period length %zu does not divide total length %zu\n", __func__,
+			period_len, len);
+	}
+
 	desc->xcnt = period_len >> shift;
 	desc->xmod = 1 << shift;
 	desc->ycnt = len / period_len;
@@ -1008,10 +1080,9 @@ static struct dma_async_tx_descriptor *adi_prep_cyclic(struct dma_chan *chan,
 
 	// Interpret prep interrupt to mean interrupt between each period,
 	// without it only interrupt after all periods for bookkeeping
+	// @todo find a way to specify that the user wants the Y interrupt
 	if (flags & DMA_PREP_INTERRUPT)
 		conf |= DI_EN_X;
-	else
-		conf |= DI_EN_Y;
 
 	if (direction == DMA_DEV_TO_MEM)
 		conf |= WNR;
