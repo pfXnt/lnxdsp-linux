@@ -312,7 +312,7 @@ static void adi_twi_handle_interrupt(struct adi_twi_iface *iface,
 				}
 			}
 
-			if (iface->pmsg[iface->cur_msg].len <= 255) {
+			if (iface->pmsg[iface->cur_msg].len < 255) {
 				writeValue = (ioread16(&iface->regs_base->master_ctl)
 					     & (~(0xff << 6)))
 					     | (iface->pmsg[iface->cur_msg].len << 6);
@@ -324,10 +324,13 @@ static void adi_twi_handle_interrupt(struct adi_twi_iface *iface,
 				iowrite16(writeValue, &iface->regs_base->master_ctl);
 				iface->manual_stop = 1;
 			}
+			
 			/* remove restart bit before last message */
-			if (iface->cur_msg + 1 == iface->msg_num)
+			if (iface->cur_msg + 1 == iface->msg_num) {
 				writeValue = ioread16(&iface->regs_base->master_ctl) & ~RSTART;
 				iowrite16(writeValue, &iface->regs_base->master_ctl);
+			}
+
 		} else {
 			iface->result = 1;
 			iowrite16(0, &iface->regs_base->int_mask);
@@ -429,7 +432,7 @@ static int adi_twi_do_master_xfer(struct i2c_adapter *adap,
 	/* Interrupt mask . Enable XMT, RCV interrupt */
 	iowrite16(MCOMP | MERR | RCVSERV | XMTSERV, &iface->regs_base->int_mask);
 
-	if (pmsg->len <= 255)
+	if (pmsg->len < 255)
 		iowrite16(pmsg->len << 6, &iface->regs_base->master_ctl);
 	else {
 		iowrite16(0xff << 6, &iface->regs_base->master_ctl);
@@ -612,7 +615,7 @@ int adi_twi_do_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 
 		iowrite16(writeValue, &iface->regs_base->int_mask);
 
-		if (iface->writeNum + 1 <= 255)
+		if (iface->writeNum < 255)
 			iowrite16((iface->writeNum + 1) << 6, &iface->regs_base->master_ctl);
 		else {
 			iowrite16(0xff << 6, &iface->regs_base->master_ctl);
@@ -648,7 +651,7 @@ int adi_twi_do_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 				if (iface->writeNum > 0) {
 					iowrite16(*(iface->transPtr++),
 						  &iface->regs_base->xmt_data8);
-					if (iface->writeNum <= 255)
+					if (iface->writeNum < 255)
 						iowrite16(iface->writeNum << 6,
 							  &iface->regs_base->master_ctl);
 					else {
@@ -661,10 +664,10 @@ int adi_twi_do_smbus_xfer(struct i2c_adapter *adap, u16 addr,
 					iowrite16(1 << 6, &iface->regs_base->master_ctl);
 				}
 			} else {
-				if (iface->readNum > 0 && iface->readNum <= 255)
+				if (iface->readNum > 0 && iface->readNum < 255)
 					iowrite16(iface->readNum << 6,
 						  &iface->regs_base->master_ctl);
-				else if (iface->readNum > 255) {
+				else if (iface->readNum >= 255) {
 					iowrite16(0xff << 6, &iface->regs_base->master_ctl);
 					iface->manual_stop = 1;
 				} else
